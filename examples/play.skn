@@ -1,0 +1,30 @@
+;;;; Play an audio file or stream, showing its tags and progress.
+;;;; Run from the package folder: skein examples/play.skn song.mp3
+
+(ns play
+  (:require [skein.sys :as sys]
+            [skein.vlc :as vlc]))
+
+(defn- clock [ms]
+  (if ms
+    (let [s (quot ms 1000)] (str (quot s 60) ":" (format "%02d" (rem s 60))))
+    "-:--"))
+
+(let [[source] (sys/program-args)]
+  (when-not source
+    (println "usage: skein examples/play.skn FILE-OR-URL")
+    (sys/exit 2))
+  (println "libVLC" (vlc/version))
+  (when-not (re-find #"://" source)
+    (let [{:keys [title artist album duration-ms]} (vlc/metadata source)]
+      (println (str title (when artist (str " by " artist)) (when album (str " from " album))
+                    " (" (clock duration-ms) ")"))))
+  (vlc/with-player [player {:volume 80}]
+    (vlc/play! player source)
+    (loop [shown nil]
+      (let [{:keys [state time-ms length-ms]} (vlc/status player)
+            line (str (name state) " " (clock time-ms) " / " (clock length-ms))]
+        (when-not (= line shown) (println line))
+        (when-not (#{:ended :stopped :error} state)
+          (sleep 250)
+          (recur line))))))

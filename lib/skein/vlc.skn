@@ -1,0 +1,443 @@
+;;;; Audio playback and metadata through libVLC 3, calling it through
+;;;; skein.ffi. libVLC is thread-safe, so most calls run on the calling
+;;;; fiber's carrier. The few that wait for VLC's own threads (starting
+;;;; libVLC, stopping, replacing or releasing a player) run on the blocking
+;;;; pool. Every call passes pointers, integers and floats only: no structs
+;;;; by value, variadic functions or callbacks.
+
+(ns skein.vlc
+  (:require [skein.ffi :as ffi]
+            [skein.io :as io]
+            [skein.sync :as sync]
+            [skein.sys :as sys])
+  (:unsafe))
+
+;; ---- the library ----
+
+(defn- library-names
+  "libvlccore's and libvlc's file names on this OS."
+  []
+  (case (sys/os)
+    :macos ["libvlccore.dylib" "libvlc.dylib"]
+    :windows ["libvlccore.dll" "libvlc.dll"]
+    ["libvlccore.so.9" "libvlc.so.5"]))
+
+(defn- install-dirs
+  "Folders where VLC usually keeps libvlc, most likely first."
+  []
+  (case (sys/os)
+    :macos (cond-> ["/Applications/VLC.app/Contents/MacOS/lib"]
+             (sys/home-dir) (conj (io/path (sys/home-dir) "Applications/VLC.app/Contents/MacOS/lib"))
+             true (into ["/opt/homebrew/lib" "/usr/local/lib"]))
+    ;; (64-bit Skein needs 64-bit VLC, which installs under Program Files)
+    :windows (->> ["ProgramW6432" "ProgramFiles"]
+                  (keep (fn [k] (not-empty (sys/getenv k))))
+                  distinct
+                  (mapv #(io/path % "VideoLAN" "VLC")))
+    []))
+
+(defn- load-from-dir
+  "Load libvlc from dir, or nil when dir has none. libvlc finds libvlccore
+  through the system loader's search path, which doesn't include libvlc's
+  own folder, so libvlccore is loaded first by its full path."
+  [dir]
+  (let [[core-name vlc-name] (library-names)
+        core-path (io/path dir core-name)
+        vlc-path (io/path dir vlc-name)]
+    (when (io/file? vlc-path)
+      (let [core (when (io/file? core-path) (ffi/library core-path))]
+        {:core core :library (ffi/library vlc-path) :dir dir}))))
+
+(defn- load-by-name []
+  (some (fn [name] (try {:library (ffi/library name)} (catch Error _ nil)))
+        (case (sys/os)
+          :macos ["libvlc.dylib"]
+          :windows ["libvlc.dll"]
+          ["libvlc.so.5" "libvlc.so"])))
+
+(def ^:private libc (delay (ffi/library :c)))
+
+(defn- point-at-plugins!
+  "On macOS libVLC can't find its plugins from a host program, so name them
+  in VLC_PLUGIN_PATH, unless it is already set. Windows and Linux builds
+  find theirs."
+  [{:keys [dir]}]
+  (when (and dir (= :macos (sys/os)) (empty? (sys/getenv "VLC_PLUGIN_PATH")))
+    (let [plugins (io/path (io/parent dir) "plugins")]
+      (when (io/directory? plugins)
+        (ffi/call (ffi/function @libc "setenv" [:string :string :i32] :i32) "VLC_PLUGIN_PATH" plugins 1)))))
+
+(def ^:private library-path (atom nil))
+(def ^:private loaded (atom nil))
+(def ^:private load-permit (sync/semaphore 1))
+
+(defn use-library!
+  "Load libVLC from path (libvlc.dll, libvlc.dylib or libvlc.so.5, with
+  libvlccore beside it) instead of looking for an installed VLC, as for a
+  copy an application downloaded or ships. It wins over SKEIN_VLC_LIBRARY.
+  Call it before anything uses libVLC."
+  [path]
+  (when @loaded (error "skein-vlc: libVLC is already loaded"))
+  (reset! library-path path)
+  nil)
+
+(defn- load-library []
+  (let [path (or @library-path (not-empty (sys/getenv "SKEIN_VLC_LIBRARY")))
+        found (if path
+                (or (load-from-dir (or (io/parent (io/absolute path)) "."))
+                    (error (str "skein-vlc: no libVLC at " path)))
+                (or (some load-from-dir (install-dirs))
+                    (load-by-name)
+                    (error (str "skein-vlc: could not load libVLC 3. Install VLC, or set "
+                                "SKEIN_VLC_LIBRARY to the path of libvlc. Looked in: "
+                                (apply str (interpose ", " (install-dirs)))))))]
+    (point-at-plugins! found)
+    found))
+
+(defn- the-library
+  "libVLC, loaded on first use. A failure isn't remembered, so a program
+  can install VLC and try again."
+  []
+  (or @loaded
+      (sync/with-permit load-permit
+        (or @loaded (reset! loaded (load-library))))))
+
+(defn available?
+  "Can libVLC be loaded? Loads it if it can."
+  []
+  (try (the-library) true (catch Error _ false)))
+
+(defmacro ^:private defvlc
+  "A private function calling libVLC's cname, resolved on first use."
+  [fname cname params ret & opts]
+  `(let [f# (delay (ffi/function (:library (the-library)) ~cname ~params ~ret ~@opts))]
+     (defn- ~fname [& args#] (apply ffi/call @f# args#))))
+
+(defvlc get-version "libvlc_get_version" [] :string)
+(defvlc errmsg "libvlc_errmsg" [] :string)
+(defvlc vlc-new "libvlc_new" [:i32 :pointer] :pointer :blocking true)
+(defvlc vlc-free "libvlc_free" [:pointer] :void)
+
+(defvlc media-new-path "libvlc_media_new_path" [:pointer :string] :pointer)
+(defvlc media-new-location "libvlc_media_new_location" [:pointer :string] :pointer)
+(defvlc media-add-option "libvlc_media_add_option" [:pointer :string] :void)
+(defvlc media-release "libvlc_media_release" [:pointer] :void)
+(defvlc media-meta "libvlc_media_get_meta" [:pointer :i32] :pointer)
+(defvlc media-duration "libvlc_media_get_duration" [:pointer] :i64)
+(defvlc media-parse "libvlc_media_parse_with_options" [:pointer :i32 :i32] :i32)
+(defvlc media-parsed-status "libvlc_media_get_parsed_status" [:pointer] :i32)
+
+(defvlc player-new "libvlc_media_player_new" [:pointer] :pointer)
+(defvlc player-release "libvlc_media_player_release" [:pointer] :void :blocking true)
+(defvlc player-set-media "libvlc_media_player_set_media" [:pointer :pointer] :void :blocking true)
+(defvlc player-media "libvlc_media_player_get_media" [:pointer] :pointer)
+(defvlc player-play "libvlc_media_player_play" [:pointer] :i32)
+(defvlc player-set-pause "libvlc_media_player_set_pause" [:pointer :i32] :void)
+(defvlc player-toggle-pause "libvlc_media_player_pause" [:pointer] :void)
+(defvlc player-stop "libvlc_media_player_stop" [:pointer] :void :blocking true)
+(defvlc player-state "libvlc_media_player_get_state" [:pointer] :i32)
+(defvlc player-time "libvlc_media_player_get_time" [:pointer] :i64)
+(defvlc player-set-time "libvlc_media_player_set_time" [:pointer :i64] :void)
+(defvlc player-length "libvlc_media_player_get_length" [:pointer] :i64)
+(defvlc player-seekable "libvlc_media_player_is_seekable" [:pointer] :i32)
+(defvlc player-rate "libvlc_media_player_get_rate" [:pointer] :f32)
+(defvlc player-set-rate "libvlc_media_player_set_rate" [:pointer :f32] :i32)
+(defvlc audio-volume "libvlc_audio_get_volume" [:pointer] :i32)
+(defvlc audio-set-volume "libvlc_audio_set_volume" [:pointer :i32] :i32)
+(defvlc audio-mute "libvlc_audio_get_mute" [:pointer] :i32)
+(defvlc audio-set-mute "libvlc_audio_set_mute" [:pointer :i32] :void)
+
+(defn- fail [what]
+  (error (str "skein-vlc: " what (when-let [why (not-empty (errmsg))] (str ": " why)))))
+
+(defn version
+  "The loaded libVLC's version, such as \"3.0.24 Vetinari\"."
+  []
+  (get-version))
+
+;; ---- the libVLC instance ----
+
+;; libVLC recommends one instance per process. It starts on first use with
+;; the default options plus any given to configure!, and lasts as long as
+;; the process.
+(def ^:private default-options ["--no-video" "--quiet"])
+(def ^:private instance-permit (sync/semaphore 1))
+(def ^:private instance-state (atom {:options [] :address nil}))
+
+(defn configure!
+  "Set extra libVLC command-line options, such as [\"--aout=adummy\"], for the
+  process's libVLC instance. Call it before the first player or metadata
+  call; after that it only accepts the options already in use."
+  [{:keys [options] :or {options []}}]
+  (when-not (and (vector? options) (every? string? options))
+    (error "skein-vlc: :options must be a vector of strings"))
+  (sync/with-permit instance-permit
+    (let [{:keys [address] :as current} @instance-state]
+      (when (and address (not= options (:options current)))
+        (error "skein-vlc: libVLC has already started with other options"))
+      (swap! instance-state assoc :options options)))
+  nil)
+
+(defn- new-instance [options]
+  (let [args (into default-options options)
+        size (ffi/sizeof :pointer)
+        ;; (libVLC may keep pointers into its arguments, so they stay allocated)
+        argv (ffi/alloc (* size (max 1 (count args))))]
+    (doseq [[i arg] (map-indexed vector args)]
+      (ffi/mem-set! argv :pointer (* size i) (ffi/alloc-string arg)))
+    (let [address (vlc-new (count args) argv)]
+      (when (zero? address)
+        (fail (str "could not start libVLC with options " (pr-str args))))
+      address)))
+
+(defn- instance []
+  (or (:address @instance-state)
+      (sync/with-permit instance-permit
+        (or (:address @instance-state)
+            (let [address (new-instance (:options @instance-state))]
+              (swap! instance-state assoc :address address)
+              address)))))
+
+;; ---- media ----
+
+(defn- url? [source] (boolean (re-matches #"[A-Za-z][A-Za-z0-9+.-]*://.+" source)))
+
+(defn- new-media
+  "A new libvlc_media_t for source: release it."
+  [source]
+  (when-not (string? source)
+    (error "skein-vlc: source must be a file path or URL string" source))
+  (let [address (if (url? source)
+                  (media-new-location (instance) source)
+                  (do (when-not (io/file? source)
+                        (error (str "skein-vlc: no such file: " source)))
+                      (media-new-path (instance) (io/absolute source))))]
+    (when (zero? address) (fail (str "could not open " source)))
+    address))
+
+(def ^:private meta-keys
+  "libvlc_meta_t's values in order."
+  [:title :artist :genre :copyright :album :track-number :description :rating
+   :date :setting :url :language :now-playing :publisher :encoded-by :artwork-url
+   :track-id :track-total :director :season :episode :show-name :actors
+   :album-artist :disc-number :disc-total])
+
+(defn- read-meta [media]
+  (into {}
+        (keep-indexed
+          (fn [i k]
+            (let [address (media-meta media i)]
+              (when (pos? address)
+                (try
+                  (when-let [text (not-empty (ffi/string-at address))] [k text])
+                  (finally (vlc-free address))))))
+          meta-keys)))
+
+(defn- with-duration [info ms]
+  (cond-> info (pos? ms) (assoc :duration-ms ms)))
+
+(def ^:private parse-network 0x01)
+(def ^:private fetch-local 0x02)
+(def ^:private parsed-failed 2)
+(def ^:private parsed-timeout 3)
+
+(defn- parse! [media source timeout-ms art?]
+  (when-not (zero? (media-parse media (+ (if (url? source) parse-network 0) (if art? fetch-local 0)) timeout-ms))
+    (fail (str "could not read " source)))
+  ;; (libVLC parses on a thread of its own and ends with a status, at the
+  ;; latest when timeout-ms passes; the deadline here is only a backstop)
+  (let [deadline (+ (nano-time) (* (+ timeout-ms 2000) 1000000))]
+    (loop []
+      (let [status (media-parsed-status media)]
+        (cond
+          (= status parsed-failed) (error (str "skein-vlc: could not read " source))
+          (= status parsed-timeout) (error (str "skein-vlc: timed out reading " source))
+          (pos? status) nil
+          (> (nano-time) deadline) (error (str "skein-vlc: timed out reading " source))
+          :else (do (sleep 10) (recur)))))))
+
+(declare player? with-handle)
+
+(defn metadata
+  "The tags and duration of a file path or URL, or of what a player is
+  playing: a map of the keys present among :title :artist :album :genre
+  :date :track-number :now-playing (a stream's current song) and the rest of
+  libvlc_meta_t, plus :duration-ms when known. libVLC gives the file name as
+  :title when a file has no title tag. Option :timeout-ms (5000 by default)
+  bounds reading a source. Option :art? true also looks for cover art, in
+  the file and beside it: :artwork-url is then a file:// URL of a copy in
+  VLC's art cache."
+  ([source] (metadata source {}))
+  ([source {:keys [timeout-ms art?] :or {timeout-ms 5000}}]
+   (if (player? source)
+     (with-handle source
+       (fn [handle]
+         (let [media (player-media handle)]
+           (when (pos? media)
+             (try (with-duration (read-meta media) (player-length handle))
+                  (finally (media-release media)))))))
+     (do
+       (when-not (and (integer? timeout-ms) (< 0 timeout-ms 600001))
+         (error "skein-vlc: :timeout-ms must be in 1..600000"))
+       (let [media (new-media source)]
+         (try
+           (parse! media source timeout-ms art?)
+           (with-duration (read-meta media) (media-duration media))
+           (finally (media-release media))))))))
+
+;; ---- players ----
+
+(defclass Player () ((handle) (permit) (closed) (source)))
+
+(defn player? "Is x a player?" [x] (instance? Player x))
+
+(def ^:private states
+  [:idle :opening :buffering :playing :paused :stopped :ended :error])
+
+(defn- with-handle [player f]
+  (when-not (player? player) (error "skein-vlc: expected a player" player))
+  (sync/with-permit (:permit player)
+    (when @(:closed player) (error "skein-vlc: player is closed"))
+    (f (:handle player))))
+
+(defn- check-volume [volume]
+  (when-not (and (integer? volume) (<= 0 volume 200))
+    (error "skein-vlc: volume must be an integer in 0..200" volume)))
+
+(defn set-volume!
+  "Set the volume, in percent: 0 is silent and 100 is the file's own level,
+  up to 200. Fails while the audio output doesn't support volume."
+  [player volume]
+  (check-volume volume)
+  (with-handle player
+    (fn [handle]
+      (when-not (zero? (audio-set-volume handle volume)) (fail "could not set the volume"))))
+  nil)
+
+(defn open-player!
+  "Make a player. Option :volume (0..200, 100 by default) sets its volume."
+  ([] (open-player! {}))
+  ([{:keys [volume] :or {volume 100}}]
+   (check-volume volume)
+   (let [handle (player-new (instance))]
+     (when (zero? handle) (fail "could not make a player"))
+     (let [player (Player :handle handle :permit (sync/semaphore 1) :closed (atom false) :source (atom nil))]
+       (try
+         (set-volume! player volume)
+         player
+         (catch Error e
+           (player-release handle)
+           (error e)))))))
+
+(defn close-player!
+  "Stop the player and release it. Safe to call again."
+  [player]
+  (sync/with-permit (:permit player)
+    (when (compare-and-set! (:closed player) false true)
+      (player-stop (:handle player))
+      (player-release (:handle player))))
+  nil)
+
+(defmacro with-player
+  "Make a player for body and close it when body exits."
+  [[binding opts] & body]
+  `(let [~binding (open-player! ~opts)]
+     (try ~@body (~'finally (close-player! ~binding)))))
+
+(defn play!
+  "Start playing source, a file path or a URL (http://, https://, file://
+  and the rest VLC reads), replacing whatever the player had. Option
+  :start-ms starts that far in."
+  ([player source] (play! player source {}))
+  ([player source {:keys [start-ms]}]
+   (when-not (or (nil? start-ms) (and (integer? start-ms) (<= 0 start-ms)))
+     (error "skein-vlc: :start-ms must be a non-negative integer"))
+   (let [media (new-media source)]
+     (try
+       (when (and start-ms (pos? start-ms))
+         (media-add-option media (str ":start-time=" (quot start-ms 1000) "." (format "%03d" (rem start-ms 1000)))))
+       (with-handle player
+         (fn [handle]
+           (player-set-media handle media)
+           (reset! (:source player) source)
+           (when-not (zero? (player-play handle)) (fail (str "could not play " source)))))
+       ;; (the player keeps its own reference to the media)
+       (finally (media-release media))))
+   nil))
+
+(defn pause! "Pause playback." [player] (with-handle player #(player-set-pause % 1)) nil)
+(defn resume! "Resume paused playback." [player] (with-handle player #(player-set-pause % 0)) nil)
+(defn toggle-pause! "Pause or resume playback." [player] (with-handle player player-toggle-pause) nil)
+(defn stop! "Stop playback. play! starts again." [player] (with-handle player player-stop) nil)
+
+(defn state
+  "The player's state: :idle, :opening, :buffering, :playing, :paused,
+  :stopped, :ended or :error."
+  [player]
+  (with-handle player #(get states (player-state %) :idle)))
+
+(defn seek!
+  "Move to ms milliseconds in. libVLC ignores this until the media has opened
+  and for streams that can't seek; play!'s :start-ms covers starting in."
+  [player ms]
+  (when-not (and (integer? ms) (<= 0 ms)) (error "skein-vlc: seek! needs a non-negative integer of ms" ms))
+  (with-handle player #(player-set-time % ms))
+  nil)
+
+(defn volume
+  "The volume in percent, or nil when the audio output has none to report."
+  [player]
+  (with-handle player #(let [v (audio-volume %)] (when-not (neg? v) v))))
+
+(defn muted? "Is the player muted?" [player] (with-handle player #(= 1 (audio-mute %))))
+
+(defn set-muted! "Mute or unmute the player." [player muted]
+  (with-handle player #(audio-set-mute % (if muted 1 0))) nil)
+
+(defn rate "The playback rate: 1.0 is normal speed." [player]
+  (with-handle player #(double (player-rate %))))
+
+(defn set-rate!
+  "Set the playback rate, from 0.25 to 4.0: 1.0 is normal speed. The rate
+  belongs to the player, so it carries over to the next play!."
+  [player rate]
+  (when-not (and (number? rate) (<= 0.25 rate 4.0))
+    (error "skein-vlc: rate must be a number in 0.25..4.0" rate))
+  (with-handle player
+    (fn [handle]
+      (when-not (zero? (player-set-rate handle (double rate))) (fail "could not set the rate"))))
+  nil)
+
+(defn status
+  "A snapshot of the player: :state, :source, :time-ms and :length-ms (nil
+  when unknown), :volume, :muted?, :rate and :seekable?."
+  [player]
+  (with-handle player
+    (fn [handle]
+      (let [time (player-time handle) length (player-length handle) volume (audio-volume handle)]
+        {:state (get states (player-state handle) :idle)
+         :source @(:source player)
+         :time-ms (when-not (neg? time) time)
+         :length-ms (when (pos? length) length)
+         :volume (when-not (neg? volume) volume)
+         :muted? (= 1 (audio-mute handle))
+         :rate (double (player-rate handle))
+         :seekable? (= 1 (player-seekable handle))}))))
+
+(def ^:private finished #{:stopped :ended :error})
+
+(defn wait!
+  "Park until playback ends, stops or fails, or timeout-ms passes, and
+  return the state then. Returns at once when nothing has been played."
+  ([player] (wait! player nil))
+  ([player timeout-ms]
+   (when-not (or (nil? timeout-ms) (and (integer? timeout-ms) (<= 0 timeout-ms)))
+     (error "skein-vlc: timeout-ms must be a non-negative integer"))
+   (let [deadline (when timeout-ms (+ (nano-time) (* timeout-ms 1000000)))]
+     (loop []
+       (let [s (state player)]
+         (if (or (finished s)
+                 (nil? @(:source player))
+                 (and deadline (>= (nano-time) deadline)))
+           s
+           (do (sleep 20) (recur))))))))

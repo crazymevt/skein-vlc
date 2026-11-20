@@ -1,0 +1,95 @@
+(ns vlc-test
+  (:require [skein.io :as io]
+            [skein.test :refer [deftest is]]
+            [skein.vlc :as vlc]))
+
+;; A two-second silent FLAC with tags, so the tests make no sound through
+;; the real audio output.
+(def ^:private fixture "tests/fixtures/silence.flac")
+
+(defn- await-state
+  "Poll until the player reaches state, for up to 3 seconds: the state then."
+  [player wanted]
+  (loop [n 0]
+    (let [s (vlc/state player)]
+      (if (or (= s wanted) (>= n 150)) s (do (sleep 20) (recur (inc n)))))))
+
+(deftest a-version
+  (is (re-find #"^3\." (vlc/version))))
+
+(deftest metadata-of-a-file
+  (let [info (vlc/metadata fixture)]
+    (is (= "Quiet Test" (:title info)))
+    (is (= "Skein" (:artist info)))
+    (is (= "Fixtures" (:album info)))
+    (is (= "Silence" (:genre info)))
+    (is (= "3" (:track-number info)))
+    (is (<= 1900 (:duration-ms info) 2100)))
+  (is (= "Quiet Test" (:title (vlc/metadata (str "file://" (io/absolute fixture))))) "a file:// URL")
+  (is (thrown? Error (vlc/metadata "tests/fixtures/missing.flac")))
+  (is (thrown? Error (vlc/metadata 42)))
+  (is (thrown? Error (vlc/metadata fixture {:timeout-ms 0}))))
+
+(deftest a-playback-session
+  (vlc/with-player [player {:volume 40}]
+    (is (= :idle (vlc/state player)))
+    (is (= :idle (vlc/wait! player)) "nothing played yet")
+    (vlc/play! player fixture)
+    (is (= :playing (await-state player :playing)))
+    (let [s (vlc/status player)]
+      (is (= fixture (:source s)))
+      (is (<= 1900 (:length-ms s) 2100))
+      (is (= 40 (:volume s)))
+      (is (true? (:seekable? s))))
+    (is (= "Quiet Test" (:title (vlc/metadata player))) "what the player is playing")
+    (vlc/pause! player)
+    (is (= :paused (await-state player :paused)))
+    (vlc/seek! player 1500)
+    (is (= 1500 (:time-ms (vlc/status player))))
+    (vlc/set-volume! player 70)
+    (is (= 70 (vlc/volume player)))
+    (vlc/set-muted! player true)
+    (is (true? (vlc/muted? player)))
+    (vlc/set-muted! player false)
+    (is (false? (vlc/muted? player)))
+    (vlc/set-rate! player 2.0)
+    (is (= 2.0 (vlc/rate player)))
+    (vlc/resume! player)
+    (is (= :ended (vlc/wait! player 5000)))
+    (is (= 2.0 (vlc/rate player)) "the rate lasts past the end")
+    (vlc/set-rate! player 1.0)
+    (vlc/play! player fixture {:start-ms 1000})
+    (is (= :playing (await-state player :playing)) "plays again after ending")
+    ;; (libVLC reports 0 until its first time update, a few hundred ms in)
+    (is (<= 900 (loop [n 0]
+                  (let [t (:time-ms (vlc/status player))]
+                    (if (or (pos? t) (>= n 150)) t (do (sleep 20) (recur (inc n)))))))
+        "starts a second in")
+    (vlc/stop! player)
+    (is (= :stopped (vlc/wait! player 5000)))))
+
+(deftest bad-arguments
+  (vlc/with-player [player {}]
+    (is (thrown? Error (vlc/set-volume! player 201)))
+    (is (thrown? Error (vlc/set-volume! player 0.5)))
+    (is (thrown? Error (vlc/set-rate! player 0)))
+    (is (thrown? Error (vlc/seek! player -1)))
+    (is (thrown? Error (vlc/play! player "tests/fixtures/missing.flac")))
+    (is (thrown? Error (vlc/play! player fixture {:start-ms -5})))
+    (is (thrown? Error (vlc/wait! player -1))))
+  (is (thrown? Error (vlc/open-player! {:volume 300})))
+  (is (thrown? Error (vlc/state :not-a-player))))
+
+(deftest a-closed-player
+  (let [player (vlc/open-player!)]
+    (vlc/play! player fixture)
+    (vlc/close-player! player)
+    (vlc/close-player! player)
+    (is (thrown? Error (vlc/state player)))
+    (is (thrown? Error (vlc/play! player fixture)))))
+
+(deftest configure-after-start
+  (vlc/metadata fixture)
+  (is (nil? (vlc/configure! {})) "the options in use")
+  (is (thrown? Error (vlc/configure! {:options ["--aout=adummy"]})))
+  (is (thrown? Error (vlc/configure! {:options "--aout=adummy"}))))
